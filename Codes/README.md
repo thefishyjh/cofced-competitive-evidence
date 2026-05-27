@@ -17,7 +17,40 @@ Tips: - Adding a `logs` dir to the path of `datasets`.
 It is recommended to run on linux servers with the following script: 
 `python train_exp_fc5_xxx.py`
 
-## 3. Please cite this paper as follows （BibTeX）: 
+## 4. Build source-weighted competitive evidence features
+This project also includes an incremental evidence feature pipeline under
+`Codes/competitive_evidence/`. It keeps the original CofCED model untouched and
+exports source-weighted support/refute evidence pools for later ablation or model
+integration.
+
+LIAR-RAW example:
+```
+python Codes/competitive_evidence/build_features.py --input Codes/dataset/LIAR-RAW/train.json --output Codes/dataset/features/liar_raw_train_competitive.json
+```
+
+RAWFC example:
+```
+python Codes/competitive_evidence/build_features.py --input Codes/dataset/RAWFC/test --output Codes/dataset/features/rawfc_test_competitive.json
+```
+
+Quick smoke test:
+```
+python Codes/competitive_evidence/build_features.py --input Codes/dataset/LIAR-RAW/train.json --output Codes/dataset/features/liar_raw_smoke_competitive.json --limit 3
+```
+
+Build all LIAR-RAW feature splits used by the competitive CofCED pipeline:
+```
+python Codes/competitive_evidence/build_features.py --input Codes/dataset/LIAR-RAW/train.json --output Codes/dataset/features/liar_raw_train_competitive.json
+python Codes/competitive_evidence/build_features.py --input Codes/dataset/LIAR-RAW/val.json --output Codes/dataset/features/liar_raw_val_competitive.json
+python Codes/competitive_evidence/build_features.py --input Codes/dataset/LIAR-RAW/test.json --output Codes/dataset/features/liar_raw_test_competitive.json
+```
+
+After training `train_exp_fc5_LIAR_RAW2.py`, export six-class test predictions:
+```
+python Codes/predict_liar_raw_competitive.py --model path/to/best_model.pt --data Codes/dataset/LIAR-RAW/test.json --features Codes/dataset/features/liar_raw_test_competitive.json --output Codes/dataset/features/predictions_liar_raw_competitive.jsonl
+```
+
+## 5. Please cite this paper as follows （BibTeX）: 
 ```
 @inproceedings{yang2022cofced,
   title={A Coarse-to-fine Cascaded Evidence-Distillation Neural Network for Explainable Fake News Detection},

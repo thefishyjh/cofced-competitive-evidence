@@ -1,14 +1,18 @@
 # encoding: utf-8
 # fine-tune  DistilEmbeddings
 # coling221030 @zwyang
+import os
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 from transformers import set_seed
 from transformers import get_scheduler
 from statistics import mean
-import os
 from os.path import exists
 import time
 from datetime import datetime
 import json
+from pathlib import Path
 import torch
 # import torch.nn.functional as F
 from torch import nn
@@ -16,6 +20,9 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 from os.path import join as pjoin
+import sys
+sys.path.append(pjoin(os.path.dirname(os.path.abspath(__file__)), 'helpers'))
+sys.path.append(pjoin(os.path.dirname(os.path.abspath(__file__)), 'model'))
 
 from sklearn.metrics import accuracy_score
 from sklearn.metrics import precision_score
@@ -26,9 +33,6 @@ from helpers.reader5 import load_df_dataset
 from helpers.reader5 import myDataset
 from helpers.utils import rouge_results_to_str, compute_rouge_from_array
 
-import sys
-sys.path.append('helpers/')
-sys.path.append('model/')
 # from logger import Logger
 # from model import BasicFC
 from model_exp_fc5 import ExplainFC #DistilEmbeddings
@@ -40,13 +44,11 @@ from helpers.path_util import from_project_root, dirname
 from eval_exp_fc5 import evaluate_model, loss_func
 
 from helpers.simple_logger import SimpleLogger
-os.environ["CUDA_VISIBLE_DEVICES"] = '1'#3
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+from competitive_evidence.build_features import FEATURE_SCHEMA_VERSION, build_feature_payload, build_features, dump_json, load_instances
 
 import math
 import torch.nn.functional as F
 import warnings
-warnings.filterwarnings('ignore')  # "error", "ignore", "always", "default", "module" or "once"
 
 torch.manual_seed(100)
 set_seed(100)
@@ -55,12 +57,13 @@ REPORT_EACH_CLAIM = 30 #Totally retrive how many reprots for each claim
 sent_dim = 768#384#768
 num_prerun = 1
 
-batch_size = 2
+batch_size = 1
 learning_rate = 1e-5 #0.0005#1e-3
-n_epochs = 8#30
+n_epochs = 1#30
 EMBED_URL = "dataset/oracles/embeddings.npy"
 
-ROOT_PROJ_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "/CofCED/dataset/LIAR-RAW"
+CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_PROJ_PATH = pjoin(CODE_DIR, "dataset", "LIAR-RAW")
 output_vocab = "vocab.json"
 output_char_vocab = "char_vocab.json"
 
@@ -70,13 +73,107 @@ EARLY_STOP = 3#5
 MAX_GRAD_NORM = 5
 N_TAGS = 6
 date_str = str(datetime.now()).split('.')[0].replace(' ', '_').replace(':', '')
-LOG_FILE = pjoin(os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "/CofCED/dataset/logs", f"{date_str}_DOC_ExplainFC5-DistilBERT_auto_{ROOT_PROJ_PATH.split('/')[-1]}2-all.log")
+LOG_DIR = pjoin(CODE_DIR, "dataset", "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = pjoin(LOG_DIR, f"{date_str}_DOC_ExplainFC5-DistilBERT_auto_{os.path.basename(ROOT_PROJ_PATH)}2-all.log")
+COMPETITIVE_FEATURE_DIR = pjoin(CODE_DIR, "dataset", "features")
+TRAIN_COMPETITIVE_FEATURES = pjoin(COMPETITIVE_FEATURE_DIR, "liar_raw_train_competitive.json")
+VAL_COMPETITIVE_FEATURES = pjoin(COMPETITIVE_FEATURE_DIR, "liar_raw_val_competitive.json")
+TEST_COMPETITIVE_FEATURES = pjoin(COMPETITIVE_FEATURE_DIR, "liar_raw_test_competitive.json")
+USE_COMPETITIVE_FEATURES = True
+COMPETITIVE_FEATURE_DIM = 10
+COMPETITIVE_HIDDEN_DIM = 64
 
 def to_np(x):
     if x == None:
         return x.cpu().data.numpy()
     else:
         return x
+
+def _load_feature_rows(path):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "rows" in data:
+        return data["rows"], data.get("metadata", {})
+    if isinstance(data, list):
+        return data, {}
+    return [data], {}
+
+def _resolve_path(path):
+    return str(Path(path).resolve())
+
+def _feature_file_is_valid(
+    input_path,
+    output_path,
+    min_coverage=0.995,
+    expected_top_k_candidates=50,
+    expected_top_k_per_pool=5,
+    log=None,
+):
+    if not exists(output_path):
+        return False
+
+    try:
+        rows, metadata = _load_feature_rows(output_path)
+        instances = load_instances(input_path)
+    except Exception as exc:
+        if log:
+            log.logger.warning("competitive feature file is unreadable and will be rebuilt: %s (%s)", output_path, exc)
+        return False
+
+    expected_ids = {str(instance.get("event_id", "")) for instance in instances if instance.get("event_id", "") != ""}
+    row_ids = {str(row.get("event_id", "")) for row in rows if row.get("event_id", "") != ""}
+    matched = len(expected_ids & row_ids)
+    coverage = matched / len(expected_ids) if expected_ids else 1.0
+    row_count_ok = len(rows) == len(instances)
+    schema_ok = metadata.get("schema_version") in (None, FEATURE_SCHEMA_VERSION)
+    candidates_ok = metadata.get("top_k_candidates") in (None, expected_top_k_candidates)
+    pool_ok = metadata.get("top_k_per_pool") in (None, expected_top_k_per_pool)
+    input_ok = not metadata.get("input_path") or _resolve_path(metadata.get("input_path")) == _resolve_path(input_path)
+
+    if log:
+        log.logger.info(
+            "competitive feature coverage for %s: %d/%d rows=%d expected=%d schema_ok=%s params_ok=%s",
+            output_path,
+            matched,
+            len(expected_ids),
+            len(rows),
+            len(instances),
+            schema_ok,
+            candidates_ok and pool_ok,
+        )
+    return coverage >= min_coverage and row_count_ok and input_ok and schema_ok and candidates_ok and pool_ok
+
+def ensure_competitive_features(
+    input_path,
+    output_path,
+    enabled=True,
+    log=None,
+    top_k_candidates=50,
+    top_k_per_pool=5,
+):
+    if not enabled:
+        return None
+    if _feature_file_is_valid(
+        input_path,
+        output_path,
+        expected_top_k_candidates=top_k_candidates,
+        expected_top_k_per_pool=top_k_per_pool,
+        log=log,
+    ):
+        return output_path
+    if log:
+        log.logger.info("building missing competitive features: %s -> %s", input_path, output_path)
+    instances = load_instances(input_path)
+    features = build_features(instances, top_k_candidates=top_k_candidates, top_k_per_pool=top_k_per_pool)
+    payload = build_feature_payload(
+        features,
+        input_path=input_path,
+        top_k_candidates=top_k_candidates,
+        top_k_per_pool=top_k_per_pool,
+    )
+    dump_json(payload, output_path)
+    return output_path
 
 def get_dynamicWA(claim_loss, sent_loss, report_loss, step=1, claim_labels=6, sent_labels=2, temperature=8.0, K=1):
     '''dynamic weight average for multi-task learning loss
@@ -135,7 +232,11 @@ def train_model(n_epochs=n_epochs,
                 log=LOG_FILE,
                 vocab_article_source=output_vocab_article_source,
                 REPORT_EACH_CLAIM=REPORT_EACH_CLAIM,
-                TOP_K=4):
+                TOP_K=4,
+                use_competitive_features=USE_COMPETITIVE_FEATURES,
+                train_competitive_features=TRAIN_COMPETITIVE_FEATURES,
+                val_competitive_features=VAL_COMPETITIVE_FEATURES,
+                test_competitive_features=TEST_COMPETITIVE_FEATURES):
 
 
     # print arguments
@@ -148,9 +249,17 @@ def train_model(n_epochs=n_epochs,
     # load_df_dataset
     # filename = pjoin(ROOT_PROJ_PATH, f'ruling_oracles_{train_file}.tsv')
     filename = pjoin(ROOT_PROJ_PATH, train_file)
+    train_competitive_features = ensure_competitive_features(filename, train_competitive_features, use_competitive_features, log)
+    val_competitive_features = ensure_competitive_features(pjoin(ROOT_PROJ_PATH, val_file), val_competitive_features, use_competitive_features, log)
+    test_competitive_features = ensure_competitive_features(pjoin(ROOT_PROJ_PATH, test_file), test_competitive_features, use_competitive_features, log) if test_file else None
     # lm_emb = DistilEmbeddings()
     # dataset = myDataset(filename, lm_emb, report_each_claim=REPORT_EACH_CLAIM)
-    dataset = myDataset(filename, report_each_claim=REPORT_EACH_CLAIM)
+    dataset = myDataset(filename, report_each_claim=REPORT_EACH_CLAIM, competitive_features_path=train_competitive_features if use_competitive_features else None)
+    if use_competitive_features:
+        matched, total, coverage = dataset.competitive_feature_coverage()
+        log.logger.info("train competitive feature coverage: %d/%d (%.2f%%)", matched, total, coverage * 100)
+        if coverage < 0.995:
+            raise RuntimeError(f"competitive feature coverage is too low: {matched}/{total}")
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=dataset.my_collate)
 
     model = ExplainFC(
@@ -166,7 +275,10 @@ def train_model(n_epochs=n_epochs,
         freeze = FREEZE_WV,
         max_doc_num=REPORT_EACH_CLAIM,#30，12
         vocab_article_source=None,#pjoin(ROOTPATH,vocab_article_source),
-        source_dim = source_dim
+        source_dim = source_dim,
+        use_competitive_features=use_competitive_features,
+        competitive_feature_dim=COMPETITIVE_FEATURE_DIM,
+        competitive_hidden_dim=COMPETITIVE_HIDDEN_DIM
     )
     # continue
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -174,6 +286,8 @@ def train_model(n_epochs=n_epochs,
 
     model = model.to(device)
     saved_model = torch.load(saved_model_url) if saved_model_url else None
+    if saved_model is not None and not hasattr(saved_model, "use_competitive_features"):
+        saved_model.use_competitive_features = False
 
     # loss and optimizer
     criterion = nn.CrossEntropyLoss(reduction='none')
@@ -306,12 +420,12 @@ def train_model(n_epochs=n_epochs,
 
         # val_file: evaling model.eval()
         cnt += 1
-        precision, recall, f1, macrof, rouges, p_sent, r_sent, f1_sent = evaluate_model(model, pjoin(ROOT_PROJ_PATH, val_file), saved_model, log=log, report_each_claim=REPORT_EACH_CLAIM).values()
+        precision, recall, f1, macrof, rouges, p_sent, r_sent, f1_sent = evaluate_model(model, pjoin(ROOT_PROJ_PATH, val_file), saved_model, log=log, report_each_claim=REPORT_EACH_CLAIM, competitive_features_path=val_competitive_features if use_competitive_features else None).values()
         print('OOOOh my god, buy it! zzwzw', p_sent, r_sent, f1_sent)
         if macrof > max_f1:
             # max_rouge, max_rouge_epoch = rouges["rouge2_f1"], epoch+1 if rouges["rouge2_f1"] > max_rouge else max_rouge, max_rouge_epoch
             max_f1, max_f1_epoch = macrof, epoch+1
-            name = 'split' if saved_model else ROOT_PROJ_PATH.split('/')[-1] #'ExplainFC'
+            name = 'split' if saved_model else os.path.basename(ROOT_PROJ_PATH) #'ExplainFC'
             if save_only_best and best_model_url:
                 os.remove(best_model_url)
             # best_model_url = from_project_root("%s_model_epoch%d_%f.pt" % (name, epoch, f1))
@@ -326,12 +440,14 @@ def train_model(n_epochs=n_epochs,
         if cnt >= early_stop > 0:
             break
 
-    if test_file:
+    if test_file and best_model_url:
         best_model = torch.load(best_model_url)
         log.logger.info("best model url: %s", best_model_url)
         log.logger.info("evaluating on test dataset: %s", test_file)
-        tese_precision, test_recall, test_micf1, test_macrof, test_rouges, test_p_sent, test_r_sent, test_f1_sent = evaluate_model(best_model, pjoin(ROOT_PROJ_PATH, test_file), saved_model, log=log, report_each_claim=REPORT_EACH_CLAIM).values()
+        tese_precision, test_recall, test_micf1, test_macrof, test_rouges, test_p_sent, test_r_sent, test_f1_sent = evaluate_model(best_model, pjoin(ROOT_PROJ_PATH, test_file), saved_model, log=log, report_each_claim=REPORT_EACH_CLAIM, competitive_features_path=test_competitive_features if use_competitive_features else None).values()
         log.logger.info("results on the test set: P %6f, R %6f, micF %6f, macF %6f.\n P_sent %6f, R_sent %6f, macF_sent %6f.\n  Finished!" % (tese_precision, test_recall, test_micf1, test_macrof, test_p_sent, test_r_sent, test_f1_sent))
+    elif test_file:
+        log.logger.warning("skipping test evaluation because no best model was saved")
     log.logger.info(arguments)
     log.logger.info(LOG_FILE)
 

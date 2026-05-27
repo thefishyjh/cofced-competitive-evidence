@@ -15,6 +15,7 @@ import helpers.json_util as ju
 
 from tqdm import tqdm
 import pickle
+import warnings
 
 # from helpers.lm_embeddings import data2ids, list2str
 import sys
@@ -53,13 +54,29 @@ else:
 
 TOP_K_ORACLE_NUMS = 5#prepare 5 FOR PUB_ORACLE , 5 FOR LIAR-PLUS
 
+COMPETITIVE_FEATURE_NAMES = [
+    "support_strength",
+    "refute_strength",
+    "conflict_score",
+    "margin_score",
+    "num_support",
+    "num_refute",
+    "avg_support_source_score",
+    "avg_refute_source_score",
+    "max_support_weight",
+    "max_refute_weight",
+]
+
 class myDataset(Dataset):
     # def __init__(self, data_file, lm_emb, report_each_claim=30):
-    def __init__(self, data_file, report_each_claim=30):
+    def __init__(self, data_file, report_each_claim=30, competitive_features_path=None):
         super().__init__()
         # self.df = pd.read_csv(csv_file, sep='\t')
         # json obj list
         self.df = self.read_from_dir(data_file)
+        self.competitive_features_path = competitive_features_path
+        self.competitive_feature_map = self.load_competitive_features(competitive_features_path)
+        self._missing_competitive_features = 0
         
         self.finetune = False#False
         self.report_each_claim = report_each_claim
@@ -68,7 +85,7 @@ class myDataset(Dataset):
         # self.lm_emb = PreEmbeddedLM(f'./dataset/oracles/albert.emb.pkl')
         # self.lm_emb = DistilEmbeddings() #SentenceTransformer('paraphrase-MiniLM-L6-v2')
 
-        self.tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')#("bert-base-uncased")
+        self.tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased', local_files_only=True)#("bert-base-uncased")
         # self.embedding_cache_path = from_project_root(ROOT_PROJ_PATH+"/pub.emb.pkl")##.format(dataset)
         # self.dataset = self.generate_beans(self.df)
         # self._x, self._justs, self._y = self.generate_beans(self.df)
@@ -122,6 +139,69 @@ class myDataset(Dataset):
                         obj = json.load(json_file)
                         all_data.append(obj)
             return all_data
+
+    def load_competitive_features(self, path):
+        if not path:
+            return {}
+        if not os.path.exists(path):
+            warnings.warn(f"competitive feature file not found: {path}; using zero vectors")
+            return {}
+
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if not content:
+            return {}
+        lines = content.splitlines()
+        first_line = lines[0].strip()
+        if len(lines) > 1 and first_line.startswith("{") and first_line != "{":
+            rows = [json.loads(line) for line in lines if line.strip()]
+        elif content[0] in "[{":
+            try:
+                data = json.loads(content)
+                if isinstance(data, dict) and "rows" in data:
+                    rows = data["rows"]
+                elif isinstance(data, list):
+                    rows = data
+                else:
+                    rows = [data]
+            except json.JSONDecodeError:
+                rows = [json.loads(line) for line in lines if line.strip()]
+        else:
+            rows = [json.loads(line) for line in lines if line.strip()]
+
+        feature_map = {}
+        for row in rows:
+            event_id = str(row.get("event_id", ""))
+            if event_id:
+                feature_map[event_id] = row
+        return feature_map
+
+    def get_competitive_feature_row(self, event_id):
+        row = self.competitive_feature_map.get(str(event_id))
+        if row is None:
+            self._missing_competitive_features += 1
+            if self._missing_competitive_features <= 3:
+                warnings.warn(f"missing competitive features for event_id={event_id}; using zero vector")
+            return {
+                "event_id": str(event_id),
+                **{name: 0.0 for name in COMPETITIVE_FEATURE_NAMES},
+                "support_evidence": [],
+                "refute_evidence": [],
+                "neutral_evidence": [],
+                "explanation": "",
+            }
+        return row
+
+    def get_competitive_feature_vector(self, event_id):
+        row = self.get_competitive_feature_row(event_id)
+        return [float(row.get(name, 0.0) or 0.0) for name in COMPETITIVE_FEATURE_NAMES], row
+
+    def competitive_feature_coverage(self):
+        if not self.competitive_feature_map:
+            return 0, len(self.event_id), 0.0
+        matched = sum(1 for event_id in self.event_id if str(event_id) in self.competitive_feature_map)
+        total = len(self.event_id)
+        return matched, total, matched / total if total else 1.0
 
     def load_raw(self, df):
         '''parsing dict objs to list '''
@@ -232,6 +312,8 @@ class myDataset(Dataset):
         # return raw_text for ROUGE computate
         # event_id, claim, label,  explain, link, content,  domain, report_sents, report_is_evidence = raw_data_list
         raw_text_dict['_CLAIM_TOK'] = raw_data_list[1]
+        raw_text_dict['event_id'] = raw_data_list[0]
+        raw_text_dict['label'] = raw_data_list[2]
         # raw_text_dict['_TGT'] = _TGT
         raw_text_dict['_TGT_TOK'] = raw_data_list[3]
         # raw_text_dict['_SRC'] = _SRC
@@ -252,6 +334,14 @@ class myDataset(Dataset):
         lm_ids_dict['num_oracle_eachdoc'] = num_oracle_eachdoc
         lm_ids_dict['report_domains'] = gen_domain_id(raw_data_list[6], device=_device)
         # lm_ids_dict['report_domains_ids'] = []
+
+        competitive_features, competitive_feature_rows = [], []
+        for event_id_value in raw_data_list[0]:
+            feature_vector, feature_row = self.get_competitive_feature_vector(event_id_value)
+            competitive_features.append(feature_vector)
+            competitive_feature_rows.append(feature_row)
+        lm_ids_dict['competitive_features'] = torch.FloatTensor(competitive_features).to(_device)
+        raw_text_dict['competitive_feature_rows'] = competitive_feature_rows
 
         max_length = cal_max_word_num(raw_data_list)
 

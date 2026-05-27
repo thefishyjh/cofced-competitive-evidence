@@ -3,8 +3,13 @@ from statistics import mean
 from datetime import datetime
 from logging import log
 import os
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
 from os.path import join as pjoin
 from posixpath import join
+import sys
+sys.path.append(pjoin(os.path.dirname(os.path.abspath(__file__)), 'helpers'))
+sys.path.append(pjoin(os.path.dirname(os.path.abspath(__file__)), 'model'))
 import torch
 from torch.utils.data import DataLoader
 from sklearn.metrics import classification_report, f1_score
@@ -23,9 +28,6 @@ from helpers.utils import rouge_results_to_str, compute_rouge_from_array
 
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
-import sys
-sys.path.append('helpers/')
-sys.path.append('model/')
 from tqdm import tqdm
 # from logger import Logger
 # from model import BasicFC
@@ -33,7 +35,6 @@ from tqdm import tqdm
 # TOP_K = 12#55 
 TOP_K = 12#55
 # MAX_ORACLE= 55 # 最多的oracle的句子数
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 # ROOT_PROJ_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "AFC/dataset/oracles"
 LABEL_IDS = {"pants-fire": 0, "false": 1, "barely-true": 2, "half-true": 3, "mostly-true": 4, "true": 5} #LIAR & LIAR-RAW
 # LABEL_IDS = {"false": 0, "true": 1, "half": 2}#RAWFC
@@ -51,7 +52,7 @@ def loss_func(criterion, y_pred, y_true, mask=None):
         loss_ *= mask     # 将正常计算的loss加上mask的权重，就剔除了padding 0的影响 
     return loss_.mean()
 #top_k=4
-def evaluate_model(model, data_url, bsl_model=None, criterion=None, sent_criterion=None, doc_criterion=None, log=None, top_k=4, report_each_claim=12):
+def evaluate_model(model, data_url, bsl_model=None, criterion=None, sent_criterion=None, doc_criterion=None, log=None, top_k=4, report_each_claim=12, competitive_features_path=None):
     """ evaluating Fact-checking model on data_url
 
     Args:
@@ -66,7 +67,9 @@ def evaluate_model(model, data_url, bsl_model=None, criterion=None, sent_criteri
     """
     if log == None:
         date_str = str(datetime.now()).split('.')[0].replace(' ', '_').replace(':', '')
-        LOG_FILE = pjoin(os.path.dirname(os.path.abspath(__file__)) + "/dataset/logs", f'{date_str}_exp_fc_test.log')
+        log_dir = pjoin(os.path.dirname(os.path.abspath(__file__)), "dataset", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        LOG_FILE = pjoin(log_dir, f'{date_str}_exp_fc_test.log')
         log = SimpleLogger(LOG_FILE, level='info', fmt='%(asctime)s - %(pathname)s[line:%(lineno)d] - %(levelname)s: %(message)s')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if criterion == None:
@@ -83,8 +86,8 @@ def evaluate_model(model, data_url, bsl_model=None, criterion=None, sent_criteri
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # dataset = myDataset(pjoin(ROOT_PROJ_PATH, data_url))
-    dataset = myDataset(data_url, report_each_claim=report_each_claim)
-    loader = DataLoader(dataset, batch_size=2, shuffle=False, collate_fn=dataset.my_collate)#200
+    dataset = myDataset(data_url, report_each_claim=report_each_claim, competitive_features_path=competitive_features_path)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=dataset.my_collate)#200
     ret = {'precision': 0, 'recall': 0, 'f1': 0}
 
     sentence_true_list, sentence_pred_list = list(), list()

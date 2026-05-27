@@ -41,12 +41,16 @@ MAX_ORACLE= 55 # 最多的oracle的句子数
 
 class ExplainFC(nn.Module):
     def __init__(self, hidden_size, n_tags, embedding_url=None, bidirectional=True, lstm_layers=1,
-                 n_embeddings=None, embedding_dim=None, lm_embedding_dim = 76800, freeze=False, char_feat_dim=0, max_doc_num=12, vocab_article_source=None, source_dim=20, bert_model_or_path='distilbert-base-uncased'):
+                 n_embeddings=None, embedding_dim=None, lm_embedding_dim = 76800, freeze=False, char_feat_dim=0, max_doc_num=12, vocab_article_source=None, source_dim=20, bert_model_or_path='distilbert-base-uncased',
+                 use_competitive_features=True, competitive_feature_dim=10, competitive_hidden_dim=64):
         super(ExplainFC, self).__init__()
         self.device = torch.device("cuda" if (torch.cuda.is_available()) else "cpu")
         self.max_doc_num = max_doc_num
+        self.use_competitive_features = use_competitive_features
+        self.competitive_feature_dim = competitive_feature_dim
+        self.competitive_hidden_dim = competitive_hidden_dim
         # self.config = RobertaConfig.from_pretrained(bert_model_or_path)
-        self.bert_embedding = DistilBertModel.from_pretrained(bert_model_or_path).to(self.device)##'distilbert-base-uncased'
+        self.bert_embedding = DistilBertModel.from_pretrained(bert_model_or_path, local_files_only=True).to(self.device)##'distilbert-base-uncased'
         # self.bert_embedding = RobertaModel.from_pretrained(bert_model_or_path, config=self.config).to(self.device)##may cause OOV   'distilroberta-base'
 
         # if embedding_url:
@@ -197,7 +201,20 @@ class ExplainFC(nn.Module):
         self.reduce_layer = nn.Linear(self.n_hidden, 1)
 
         
-        self.classifier3 = FeedForward(input_dim=self.n_hidden*3, hidden_size=self.n_hidden, num_classes=n_tags, dropout_rate=0.2)#nn.Linear(self.n_hidden, n_tags) dropout_rate=0.4
+        if self.use_competitive_features:
+            self.competitive_feature_encoder = nn.Sequential(
+                nn.Linear(self.competitive_feature_dim, self.competitive_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=0.2),
+                nn.Linear(self.competitive_hidden_dim, self.competitive_hidden_dim),
+                nn.ReLU(inplace=True),
+            )
+            classifier_input_dim = self.n_hidden*3 + self.competitive_hidden_dim
+        else:
+            self.competitive_feature_encoder = None
+            classifier_input_dim = self.n_hidden*3
+
+        self.classifier3 = FeedForward(input_dim=classifier_input_dim, hidden_size=self.n_hidden, num_classes=n_tags, dropout_rate=0.2)#nn.Linear(self.n_hidden, n_tags) dropout_rate=0.4
         # self.classifier = FeedForward(self.n_hidden, self.n_hidden//2, num_classes=n_tags, dropout_rate=0.4)#nn.Linear(self.n_hidden, n_tags)
         self.mlp_layer = FeedForward(self.n_hidden*4, self.n_hidden, num_classes=1)
         # self.mlp_layer = nn.Linear(self.n_hidden, 1)
@@ -460,6 +477,12 @@ class ExplainFC(nn.Module):
         claim_ids, claim_attention_mask = lm_ids_dict['claim_ids'], lm_ids_dict['claim_masks']
         src_ids, src_attention_mask = lm_ids_dict['src_ids'], lm_ids_dict['src_masks']
         batch_size = len(claim_ids)
+        competitive_features = lm_ids_dict.get('competitive_features')
+        if self.use_competitive_features:
+            if competitive_features is None:
+                competitive_features = torch.zeros(batch_size, self.competitive_feature_dim).to(self.device)
+            else:
+                competitive_features = competitive_features.to(self.device).float()
         claim_repr = [self.bert_embedding(_claim.to(self.device)).last_hidden_state[:,0,:] for _claim in claim_ids]
         src_repr = []
         # [self.bert_embedding(_src.to(self.device)).last_hidden_state for _src in src_ids]
@@ -597,6 +620,9 @@ class ExplainFC(nn.Module):
             pool_src_repr = torch.max(s_unpacked, dim=0, keepdim=True)[0]
 
             rich_repr = torch.cat([pad_c_repr, self.dropout_layer(pool_sent_repr), self.dropout_layer(pool_src_repr)], dim=-1)
+            if self.use_competitive_features:
+                competitive_repr = self.competitive_feature_encoder(competitive_features[i:i+1])
+                rich_repr = torch.cat([rich_repr, competitive_repr], dim=-1)
 
             # task 2
             ver = self.classifier3(rich_repr)

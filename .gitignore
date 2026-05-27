@@ -1,0 +1,16 @@
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+
+# Local editor settings
+.vscode/
+
+# Large datasets and generated experiment artifacts
+Datasets/
+Codes/dataset/
+
+# Model checkpoints and temporary outputs
+*.pt
+*.pth
+*.ckpt
+*.log
