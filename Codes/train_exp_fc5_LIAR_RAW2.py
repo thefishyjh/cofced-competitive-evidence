@@ -53,13 +53,13 @@ import warnings
 torch.manual_seed(100)
 set_seed(100)
 
-REPORT_EACH_CLAIM = 30 #Totally retrive how many reprots for each claim
+REPORT_EACH_CLAIM = 55 # Match the LIAR-RAW setting reported in the CofCED paper.
 sent_dim = 768#384#768
 num_prerun = 1
 
 batch_size = 1
 learning_rate = 1e-5 #0.0005#1e-3
-n_epochs = 1#30
+n_epochs = 8
 EMBED_URL = "dataset/oracles/embeddings.npy"
 
 CODE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -80,7 +80,7 @@ COMPETITIVE_FEATURE_DIR = pjoin(CODE_DIR, "dataset", "features")
 TRAIN_COMPETITIVE_FEATURES = pjoin(COMPETITIVE_FEATURE_DIR, "liar_raw_train_competitive.json")
 VAL_COMPETITIVE_FEATURES = pjoin(COMPETITIVE_FEATURE_DIR, "liar_raw_val_competitive.json")
 TEST_COMPETITIVE_FEATURES = pjoin(COMPETITIVE_FEATURE_DIR, "liar_raw_test_competitive.json")
-USE_COMPETITIVE_FEATURES = True
+USE_COMPETITIVE_FEATURES = False
 COMPETITIVE_FEATURE_DIM = 10
 COMPETITIVE_HIDDEN_DIM = 64
 
@@ -232,7 +232,7 @@ def train_model(n_epochs=n_epochs,
                 log=LOG_FILE,
                 vocab_article_source=output_vocab_article_source,
                 REPORT_EACH_CLAIM=REPORT_EACH_CLAIM,
-                TOP_K=4,
+                TOP_K=18,
                 use_competitive_features=USE_COMPETITIVE_FEATURES,
                 train_competitive_features=TRAIN_COMPETITIVE_FEATURES,
                 val_competitive_features=VAL_COMPETITIVE_FEATURES,
@@ -294,7 +294,7 @@ def train_model(n_epochs=n_epochs,
     sent_criterion = nn.BCELoss(reduction='none', weight=torch.tensor([8]).to(device))
 
     doc_criterion = nn.BCELoss(reduction='none')
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     lr_scheduler = get_scheduler(name="linear", optimizer=optimizer, num_warmup_steps=50, num_training_steps=len(train_loader)*n_epochs)
 
